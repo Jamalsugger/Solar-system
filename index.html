@@ -1,98 +1,1352 @@
-<!DOCTYPE html>
-<html lang="en">
+import os
+import time
+import webbrowser
+import threading
+import http.server
+import socketserver
+import socket
+import json
+
+# Pin alignment offsets (degrees) per planet. In the landmark view, nudge the pin onto the
+# feature with the arrow buttons, press "Copy", and paste the line it gives you over this one
+# so the alignment sticks between runs. Example: CALIBRATION = {"mars": {"lat": 0, "lon": 180}}
+#
+# Seeded for typical NASA / Celestia-style equirectangular maps (east-positive). Values bake
+# common texture longitude zeros so researched landmark lat/lon land on visible features.
+CALIBRATION = {
+    "mercury": {"lat": 0.0, "lon": 28.0},   # MESSENGER mosaics often need a lon shift for Caloris
+    "venus":   {"lat": 0.0, "lon": 0.0},
+    "earth":   {"lat": 0.0, "lon": 0.0},
+    "mars":    {"lat": 0.0, "lon": 0.0},
+    "jupiter": {"lat": 0.0, "lon": 25.0},   # GRS drifts; offset matches common OPAL-style packs
+    "saturn":  {"lat": 0.0, "lon": 0.0},
+    "uranus":  {"lat": 0.0, "lon": 0.0},
+    "neptune": {"lat": 0.0, "lon": 50.0},   # Voyager-era GDS longitude vs typical map zero
+    "sun":     {"lat": 0.0, "lon": 0.0},
+}
+
+# Serve files (planet textures, generated HTML) from the folder this script lives in
+try:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+except NameError:
+    pass  # Running in Jupyter/IPython: __file__ is undefined, so use the current folder
+
+# Find a free port
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('', 0))
+PORT = s.getsockname()[1]
+s.close()
+
+class CORSRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        super().end_headers()
+
+socketserver.TCPServer.allow_reuse_address = True
+httpd = socketserver.TCPServer(("", PORT), CORSRequestHandler)
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+html_template = r"""<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D Solar System</title>
-    <style>
-        body {
-            margin: 0;
-            overflow: hidden;
-            background-color: #000;
-        }
-        canvas {
-            display: block;
-            width: 100vw;
-            height: 100vh;
-        }
-    </style>
+  <title>NISAR Solar System</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #000000;
+      --panel: rgba(10, 10, 10, 0.78);
+      --border: rgba(255, 255, 255, 0.1);
+      --accent: #00ffff;
+      --text: #888888;
+      --pin: #ff1e1e;
+    }
+    body { margin: 0; overflow: hidden; background: var(--bg); color: white; font-family: 'Inter', sans-serif; }
+    #space-bg {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background:
+        radial-gradient(ellipse at 30% 20%, rgba(20, 40, 90, 0.35) 0%, transparent 50%),
+        radial-gradient(ellipse at center, #0a1226 0%, #030410 45%, #000000 100%);
+      z-index: -1;
+    }
+    #ui {
+      position: absolute; top: 40px; left: 40px; background: var(--panel);
+      padding: 24px; border-radius: 12px; border: 1px solid var(--border);
+      width: 260px; backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      transition: opacity 0.3s; z-index: 100;
+    }
+    h1 { font-size: 14px; margin: 0 0 20px 0; color: #fff; letter-spacing: 4px; font-weight: 600; text-transform: uppercase; }
+    .label { font-size: 9px; color: #555; text-transform: uppercase; letter-spacing: 2px; margin-top: 25px; margin-bottom: 10px; }
+    select {
+      width: 100%; padding: 12px; background: rgba(0,0,0,0.4);
+      color: white; border: 1px solid var(--border); border-radius: 6px;
+      font-family: 'Inter', sans-serif; font-size: 13px; outline: none; cursor: pointer;
+    }
+    select:hover { border-color: rgba(255,255,255,0.3); }
+    .landmark-btn {
+      display: block; width: 100%; padding: 10px 0; background: transparent;
+      color: var(--text); border: none; border-bottom: 1px solid var(--border);
+      cursor: pointer; text-align: left; font-family: 'Inter', sans-serif; font-size: 12px;
+      transition: all 0.2s;
+    }
+    .landmark-btn:hover { color: #fff; padding-left: 5px; }
+    #telemetry { margin-top: 15px; }
+    .data-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text); }
+    .data-val { color: #fff; }
+    .action-btn {
+      width: 100%; padding: 12px; margin-top: 10px; background: rgba(0, 255, 255, 0.1);
+      color: var(--accent); border: 1px solid rgba(0, 255, 255, 0.3); border-radius: 6px;
+      font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600; cursor: pointer;
+      transition: all 0.2s;
+    }
+    .action-btn:hover { background: rgba(0, 255, 255, 0.2); }
+    .zoom-controls {
+      position: absolute; right: 40px; top: 50%; transform: translateY(-50%);
+      z-index: 100; display: flex; flex-direction: column; gap: 10px;
+    }
+    .zoom-btn {
+      width: 44px; height: 44px; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 50%;
+      color: white; font-size: 20px; display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: all 0.2s; backdrop-filter: blur(10px);
+      user-select: none;
+    }
+    .zoom-btn:hover { background: rgba(255,255,255,0.15); border-color: #fff; }
+    #exit-landmark {
+      position: absolute; top: 40px; right: 40px; z-index: 200;
+      width: 44px; height: 44px; background: rgba(20,20,20,0.6);
+      border: 1px solid var(--border); border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; opacity: 0; pointer-events: none; transition: all 0.3s;
+      backdrop-filter: blur(10px);
+    }
+    #exit-landmark:hover { background: rgba(255,255,255,0.15); border-color: #fff; }
+    #exit-landmark.active { opacity: 1; pointer-events: auto; }
+    .x-icon { width: 16px; height: 16px; fill: none; stroke: #fff; stroke-width: 2; stroke-linecap: round; }
+    #modal-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.8); z-index: 500; display: flex;
+      align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.3s;
+    }
+    #modal-overlay.active { opacity: 1; pointer-events: auto; }
+    #modal {
+      background: var(--panel); padding: 30px; border-radius: 12px; border: 1px solid var(--border);
+      width: 320px; text-align: center; backdrop-filter: blur(30px);
+    }
+    #modal h2 { margin: 0 0 10px 0; font-size: 18px; color: #fff; }
+    #modal p { font-size: 12px; color: var(--text); margin-bottom: 20px; }
+    #colony-input {
+      width: 100%; padding: 12px; background: rgba(0,0,0,0.5); border: 1px solid var(--border);
+      color: #fff; font-family: 'Inter', sans-serif; font-size: 14px; border-radius: 6px;
+      outline: none; margin-bottom: 20px; box-sizing: border-box; text-align: center;
+    }
+    #colony-input:focus { border-color: var(--accent); }
+    .modal-btn-row { display: flex; gap: 10px; }
+    .modal-btn { flex: 1; padding: 12px; border-radius: 6px; font-weight: 600; cursor: pointer; border: none; font-family: 'Inter', sans-serif; }
+    .btn-confirm { background: var(--accent); color: #000; }
+    .btn-cancel { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-cancel:hover { color: #fff; border-color: #fff; }
+    #colony-display {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      z-index: 300; text-align: center; pointer-events: none; opacity: 0; transition: opacity 0.5s;
+    }
+    #colony-display.active { opacity: 1; }
+    .colony-title { font-size: 32px; font-weight: 800; color: #fff; letter-spacing: 5px; text-transform: uppercase; text-shadow: 0 0 20px rgba(0,255,255,0.6); }
+    .colony-sub { font-size: 11px; color: var(--accent); letter-spacing: 4px; margin-top: 10px; }
+    #landmark-panel {
+      position: absolute; left: 50%; bottom: 36px; transform: translateX(-50%);
+      z-index: 150; text-align: center; opacity: 0; pointer-events: none; transition: opacity 0.4s;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 20px; min-width: 300px;
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    }
+    #landmark-panel.active { opacity: 1; pointer-events: auto; }
+    #lm-name { font-size: 12px; font-weight: 600; letter-spacing: 3px; color: #fff; }
+    #lm-coords { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent); margin-top: 6px; }
+    #lm-offset { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text); margin-top: 4px; min-height: 12px; }
+    #calib { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 10px; }
+    .calib-label { font-size: 9px; color: #555; letter-spacing: 2px; text-transform: uppercase; margin-right: 4px; }
+    .calib-btn {
+      min-width: 30px; height: 28px; padding: 0 8px; background: rgba(255,255,255,0.05);
+      color: #fff; border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+      font-family: 'Inter', sans-serif; font-size: 12px; transition: all 0.2s;
+    }
+    .calib-btn:hover { background: rgba(255,255,255,0.15); border-color: #fff; }
+    #calib-step { width: 64px; padding: 4px 6px; font-size: 11px; }
+    #calib-note { font-size: 10px; color: var(--text); margin-top: 6px; max-width: 360px; word-break: break-all; }
+    #pin-legend {
+      display: none; margin-top: 8px; font-size: 10px; letter-spacing: 1px; color: var(--pin);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    #landmark-panel.active #pin-legend { display: block; }
+  </style>
 </head>
 <body>
+  <div id="space-bg"></div>
+  <div id="colony-display">
+    <div class="colony-title" id="colony-name-display">COLONY</div>
+    <div class="colony-sub">TERRITORY ESTABLISHED</div>
+  </div>
+  <div id="exit-landmark" onclick="exitLandmark()">
+    <svg class="x-icon" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>
+  </div>
+  <div class="zoom-controls">
+    <div class="zoom-btn" id="zoom-in">+</div>
+    <div class="zoom-btn" id="zoom-out">&minus;</div>
+  </div>
+  <div id="modal-overlay">
+    <div id="modal">
+      <h2>Establish Colony</h2>
+      <p>Claim this territory in the name of NISAR.</p>
+      <input type="text" id="colony-input" placeholder="Enter Colony Name..." maxlength="20" onkeydown="if(event.key==='Enter'){confirmColony();}">
+      <div class="modal-btn-row">
+        <button class="modal-btn btn-cancel" onclick="closeModal()">Cancel</button>
+        <button class="modal-btn btn-confirm" onclick="confirmColony()">Establish</button>
+      </div>
+    </div>
+  </div>
+  <div id="landmark-panel">
+    <div id="lm-name"></div>
+    <div id="lm-coords"></div>
+    <div id="lm-offset"></div>
+    <div id="pin-legend">&#9679; RED PIN MARKS FEATURE</div>
+    <div id="calib">
+      <span class="calib-label">Align pin</span>
+      <button class="calib-btn" onclick="nudge(0,-1)" title="Move pin west">&larr;</button>
+      <button class="calib-btn" onclick="nudge(1,0)" title="Move pin north">&uarr;</button>
+      <button class="calib-btn" onclick="nudge(-1,0)" title="Move pin south">&darr;</button>
+      <button class="calib-btn" onclick="nudge(0,1)" title="Move pin east">&rarr;</button>
+      <select id="calib-step">
+        <option value="0.25">0.25&deg;</option>
+        <option value="1" selected>1&deg;</option>
+        <option value="5">5&deg;</option>
+        <option value="15">15&deg;</option>
+      </select>
+      <button class="calib-btn" onclick="resetOffset()" title="Reset alignment">&#8634;</button>
+      <button class="calib-btn" onclick="copyCalibration()" title="Copy offsets to paste into the script">Copy</button>
+    </div>
+    <div id="calib-note"></div>
+  </div>
+  <div id="ui">
+    <h1>NISAR // ORBIT</h1>
+    <select id="planet-select" onchange="selectPlanet(this.value)">
+      <option value="overview">SOLAR SYSTEM OVERVIEW</option>
+      <option value="sun">THE SUN</option>
+      <option value="mercury">MERCURY</option>
+      <option value="venus">VENUS</option>
+      <option value="earth">EARTH</option>
+      <option value="mars">MARS</option>
+      <option value="jupiter">JUPITER</option>
+      <option value="saturn">SATURN</option>
+      <option value="uranus">URANUS</option>
+      <option value="neptune">NEPTUNE</option>
+    </select>
+    <div id="planet-controls" style="display:none;">
+      <div class="label">Telemetry Data</div>
+      <div id="telemetry">
+        <div class="data-row"><span>VELOCITY</span> <span class="data-val" id="val-speed">--</span></div>
+        <div class="data-row"><span>DISTANCE</span> <span class="data-val" id="val-dist">--</span></div>
+        <div class="data-row"><span>TEMP</span> <span class="data-val" id="val-temp">--</span></div>
+      </div>
+      <div class="label">Surface Landmarks</div>
+      <div id="landmarks"></div>
+      <button class="action-btn" onclick="openModal()">Plant Colony Flag</button>
+    </div>
+  </div>
 
-    <!-- Include Three.js from CDN -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
 
-    <script>
-        // 1. Scene, Camera, and Renderer Setup
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        document.body.appendChild(renderer.domElement);
+  <script>
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 3000);
+    camera.position.set(0, 60, 120);
 
-        // 2. Lighting
-        const ambientLight = new THREE.AmbientLight(0x333333);
-        scene.add(ambientLight);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.08;
+    renderer.physicallyCorrectLights = true;
+    document.body.appendChild(renderer.domElement);
 
-        const pointLight = new THREE.PointLight(0xffffff, 2, 300);
-        pointLight.position.set(0, 0, 0);
-        scene.add(pointLight);
+    const renderScene = new THREE.RenderPass(scene, camera);
+    const bloomPass = new THREE.UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      1.2, 0.5, 0.7
+    );
+    const composer = new THREE.EffectComposer(renderer);
+    composer.addPass(renderScene);
+    composer.addPass(bloomPass);
 
-        // 3. Create the Sun
-        const sunGeometry = new THREE.SphereGeometry(5, 32, 32);
-        const sunMaterial = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
-        const sun = new THREE.Mesh(sunGeometry, sunMaterial);
-        scene.add(sun);
+    // ==== LIGHTING ====
+    const ambientLight = new THREE.AmbientLight(0x8899bb, 0.12);
+    scene.add(ambientLight);
+    const sunLight = new THREE.PointLight(0xfff2d6, 2.6, 0, 0);
+    scene.add(sunLight);
 
-        // 4. Create Planets Array
-        const planetsData = [
-            { name: 'Mercury', size: 0.8, distance: 8, color: 0x888888, speed: 0.04 },
-            { name: 'Venus', size: 1.2, distance: 12, color: 0xe3bb76, speed: 0.015 },
-            { name: 'Earth', size: 1.4, distance: 17, color: 0x2233ff, speed: 0.01 },
-            { name: 'Mars', size: 1.0, distance: 22, color: 0xcc4400, speed: 0.008 }
-        ];
+    const hemi = new THREE.HemisphereLight(0xaaccff, 0x080820, 0.28);
+    scene.add(hemi);
 
-        const planets = [];
+    const fillLight = new THREE.DirectionalLight(0x4466ff, 0.28);
+    fillLight.position.set(-100, 60, -100);
+    scene.add(fillLight);
 
-        planetsData.forEach(data => {
-            const geometry = new THREE.SphereGeometry(data.size, 32, 32);
-            const material = new THREE.MeshStandardMaterial({ color: data.color, roughness: 0.8 });
-            const mesh = new THREE.Mesh(geometry, material);
-            
-            scene.add(mesh);
-            planets.push({ mesh, distance: data.distance, speed: data.speed, angle: Math.random() * Math.PI * 2 });
-        });
+    const rimLight = new THREE.DirectionalLight(0xffaa66, 0.12);
+    rimLight.position.set(80, -20, 60);
+    scene.add(rimLight);
 
-        // Position Camera
-        camera.position.set(0, 20, 35);
-        camera.lookAt(0, 0, 0);
+    const landmarkLight = new THREE.SpotLight(0xffffff, 0);
+    landmarkLight.angle = Math.PI / 4;
+    landmarkLight.penumbra = 0.6;
+    scene.add(landmarkLight);
+    scene.add(landmarkLight.target);
 
-        // 5. Animation Loop
-        function animate() {
-            requestAnimationFrame(animate);
+    const closeFill = new THREE.AmbientLight(0xffffff, 0);
+    scene.add(closeFill);
 
-            // Rotate Sun
-            sun.rotation.y += 0.002;
+    // ==== UTILITY CANVAS TEXTURES ====
+    function makeGlowTexture(r, g, b, size) {
+      size = size || 256;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      const grd = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+      grd.addColorStop(0.0, 'rgba(' + r + ',' + g + ',' + b + ',1.0)');
+      grd.addColorStop(0.22, 'rgba(' + r + ',' + g + ',' + b + ',0.6)');
+      grd.addColorStop(0.5, 'rgba(' + r + ',' + g + ',' + b + ',0.18)');
+      grd.addColorStop(1.0, 'rgba(' + r + ',' + g + ',' + b + ',0.0)');
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, 0, size, size);
+      return new THREE.CanvasTexture(canvas);
+    }
 
-            // Orbit Planets
-            planets.forEach(planet => {
-                planet.angle += planet.speed;
-                planet.mesh.position.x = Math.cos(planet.angle) * planet.distance;
-                planet.mesh.position.z = Math.sin(planet.angle) * planet.distance;
-                planet.mesh.rotation.y += 0.01;
-            });
+    const sunGlowTex = makeGlowTexture(255, 180, 90);
+    const redGlowTex = makeGlowTexture(255, 30, 30, 128);
 
-            renderer.render(scene, camera);
+    function makePlanetFallback(key, size) {
+      size = size || 1024;
+      const canvas = document.createElement('canvas');
+      canvas.width = size; canvas.height = size / 2;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+
+      function fbm(x, y) {
+        let a = 1, f = 1, t = 0, n = 0;
+        for (let i = 0; i < 5; i++) {
+          const s = Math.sin(x * f * 12.9898 + y * f * 78.233) * 43758.5453;
+          t += a * (s - Math.floor(s));
+          n += a; a *= 0.5; f *= 2;
         }
+        return t / n;
+      }
 
-        animate();
+      const img = ctx.createImageData(W, H);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const u = x / W, v = y / H;
+          const lon = u * 360 - 180;
+          const lat = 90 - v * 180;
+          const n = fbm(u * 4, v * 3);
+          let r, g, b;
+          if (key === 'mercury') {
+            const d = Math.hypot(((lon + 170.8 + 180) % 360) - 180, (lat - 30.5) * 1.2) / 28;
+            const basin = Math.max(0, 1 - d);
+            const base = 95 + n * 70;
+            r = g = b = base + basin * 50;
+            g *= 0.96; b *= 0.9;
+          } else if (key === 'venus') {
+            const d = Math.hypot(lon - 3.3, (lat - 65.2) * 1.4) / 7;
+            const hi = Math.max(0, 1 - d);
+            r = 190 + n * 35 + hi * 50; g = 130 + n * 30 + hi * 30; b = 55 + n * 15;
+          } else if (key === 'earth') {
+            const land = n > 0.52 || (Math.abs(lon - 87) < 40 && lat > 5 && lat < 55);
+            const ice = Math.abs(lat) > 70;
+            if (ice) { r = 230; g = 236; b = 245; }
+            else if (land) { r = 55 + n * 40; g = 110 + n * 45; b = 45 + n * 20; }
+            else { r = 25 + n * 15; g = 70 + n * 35; b = 150 + n * 40; }
+          } else if (key === 'mars') {
+            const oly = Math.max(0, 1 - Math.hypot(((lon + 133.8 + 180) % 360) - 180, (lat - 18.65)) / 10);
+            r = 150 + n * 45 + oly * 40; g = 75 + n * 25 + oly * 20; b = 40 + n * 15;
+            if (Math.abs(lat) > 78) { r = g = b = 220; }
+          } else if (key === 'jupiter') {
+            const bands = 0.5 + 0.5 * Math.sin(lat * 0.22 + n * 2);
+            r = 185 + bands * 45; g = 135 + bands * 35; b = 95 + bands * 15;
+            const spot = Math.max(0, 1 - Math.hypot(((lon + 55 + 180) % 360) - 180, (lat + 22) * 1.6) / 14);
+            r += spot * 70; g -= spot * 35; b -= spot * 45;
+          } else if (key === 'saturn') {
+            const bands = 0.5 + 0.5 * Math.sin(lat * 0.18);
+            r = 215 + bands * 25; g = 185 + bands * 20; b = 125 + bands * 10;
+            if (lat > 72) { r *= 0.75; g *= 0.8; b = Math.min(255, b + 40); }
+          } else if (key === 'uranus') {
+            r = 145 + n * 15; g = 205 + n * 20; b = 215 + n * 25;
+            if (lat < -55) { r += 35; g += 25; }
+          } else if (key === 'neptune') {
+            r = 45 + n * 15; g = 85 + n * 25; b = 185 + n * 35;
+            const spot = Math.max(0, 1 - Math.hypot(((lon + 0 + 180) % 360) - 180, (lat + 22) * 1.2) / 16);
+            r *= 1 - spot * 0.55; g *= 1 - spot * 0.5; b *= 1 - spot * 0.4;
+          } else {
+            r = g = b = 120 + n * 60;
+          }
+          const i = (y * W + x) * 4;
+          img.data[i] = Math.max(0, Math.min(255, r|0));
+          img.data[i+1] = Math.max(0, Math.min(255, g|0));
+          img.data[i+2] = Math.max(0, Math.min(255, b|0));
+          img.data[i+3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.encoding = THREE.sRGBEncoding;
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.anisotropy = 4;
+      return tex;
+    }
 
-        // Handle Window Resize
-        window.addEventListener('resize', () => {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
+    function makeRingTexture() {
+      const w = 1024, h = 16;
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      for (let x = 0; x < w; x++) {
+        const t = x / w;
+        let alpha = 0.58 + 0.32 * Math.sin(t * 42.0) + 0.08 * Math.sin(t * 120);
+        // Cassini Division
+        if (t > 0.54 && t < 0.63) alpha *= 0.045;
+        if (t > 0.79 && t < 0.83) alpha *= 0.12;
+        if (t > 0.14 && t < 0.18) alpha *= 0.28;
+        if (t < 0.04 || t > 0.97) alpha *= 0.15;
+        alpha = Math.max(0.01, Math.min(0.95, alpha));
+        const sh = 205 + Math.random() * 40;
+        ctx.fillStyle = 'rgba(' + (sh|0) + ',' + ((sh*0.88)|0) + ',' + ((sh*0.62)|0) + ',' + alpha + ')';
+        ctx.fillRect(x, 0, 1, h);
+      }
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      return tex;
+    }
+
+    const ringTex = makeRingTexture();
+
+    // ==== STARFIELD ====
+    (function buildStars() {
+      const count = 42000;
+      const geo = new THREE.BufferGeometry();
+      const pos = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+      const c = new THREE.Color();
+      for (let i = 0; i < count; i++) {
+        const r = 550 + Math.random() * 900;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos((Math.random() * 2) - 1);
+        pos[i*3]   = r * Math.sin(phi) * Math.cos(theta);
+        pos[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+        pos[i*3+2] = r * Math.cos(phi);
+        const roll = Math.random();
+        if (roll < 0.7) c.setRGB(1, 1, 1);
+        else if (roll < 0.85) c.setRGB(0.7, 0.82, 1.0);
+        else if (roll < 0.95) c.setRGB(1.0, 0.88, 0.68);
+        else c.setRGB(1.0, 0.55, 0.4);
+        col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      const mat = new THREE.PointsMaterial({
+        size: 1.35, vertexColors: true, transparent: true,
+        opacity: 0.9, sizeAttenuation: true, depthWrite: false
+      });
+      const stars = new THREE.Points(geo, mat);
+      scene.add(stars);
+      window._stars = stars;
+    })();
+
+    // Soft Milky Way band
+    (function buildMilkyWay() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1024; canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      const g = ctx.createLinearGradient(0, 0, 0, 256);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(0.45, 'rgba(120,140,200,0.10)');
+      g.addColorStop(0.5, 'rgba(180,190,255,0.16)');
+      g.addColorStop(0.55, 'rgba(120,140,200,0.10)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 1024, 256);
+      for (let i = 0; i < 800; i++) {
+        ctx.fillStyle = 'rgba(255,255,255,' + (Math.random() * 0.08) + ')';
+        ctx.fillRect(Math.random() * 1024, 90 + Math.random() * 70, 1, 1);
+      }
+      const tex = new THREE.CanvasTexture(canvas);
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(1400, 32, 16),
+        new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, transparent: true, depthWrite: false, opacity: 0.85 })
+      );
+      mesh.rotation.z = 0.4;
+      scene.add(mesh);
+    })();
+
+    const textureLoader = new THREE.TextureLoader();
+    textureLoader.setCrossOrigin('anonymous');
+    const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+
+    // Landmarks: [latitude, longitude east-positive, optional {ring: radius in planet radii}]
+    // Researched geographic coords; CALIBRATION / Align pin bake texture-map zeros.
+    const planetsData = [
+      { key:'sun',     dist:0,  radius:6,   texture:'sun.jpg',     color:0xffffff, speed:'220 km/s', distTxt:'0 km',      temp:'5,500°C', landmarks: {'Solar Flare':[18.0, 40.0]} },
+      { key:'mercury', dist:14, radius:0.7, texture:'mercury.jpg', color:0xbbbbbb, speed:'47 km/s',  distTxt:'57.9M km',  temp:'167°C',   landmarks: {'Caloris Basin':[30.5, 161.2]} },
+      { key:'venus',   dist:20, radius:0.9, texture:'venus.jpg',   color:0xffd9a0, speed:'35 km/s',  distTxt:'108.2M km', temp:'464°C',   landmarks: {'Maxwell Montes':[65.2, 3.3]} },
+      { key:'earth',   dist:26, radius:1.0, texture:'earth.jpg',   color:0x3d8fe0, speed:'29.8 km/s',distTxt:'149.6M km', temp:'15°C',    landmarks: {'Mount Everest':[27.99, 86.93],'Mariana Trench':[11.35, 142.2]} },
+      { key:'mars',    dist:34, radius:0.9, texture:'mars.jpg',    color:0xd06434, speed:'24 km/s',  distTxt:'227.9M km', temp:'-65°C',   landmarks: {'Olympus Mons':[18.65, 226.2],'Jezero Crater':[18.38, 77.58]} },
+      { key:'jupiter', dist:48, radius:3.5, texture:'jupiter.jpg', color:0xe0b88a, speed:'13 km/s',  distTxt:'778.5M km', temp:'-110°C',  landmarks: {'Great Red Spot':[-22.0, -55.0]} },
+      { key:'saturn',  dist:65, radius:3.0, texture:'saturn.jpg',  color:0xeeddbb, speed:'9.7 km/s', distTxt:'1.4B km',   temp:'-140°C',  rings:true, landmarks: {'North Polar Hexagon':[78.0, 0.0],'Cassini Division':[0.0, 0.0, {ring: 1.94}]} },
+      { key:'uranus',  dist:80, radius:2.0, texture:'uranus.jpg',  color:0x9adbef, speed:'6.8 km/s', distTxt:'2.9B km',   temp:'-195°C',  landmarks: {'Southern Polar Region':[-72.0, 0.0]} },
+      { key:'neptune', dist:95, radius:2.0, texture:'neptune.jpg', color:0x3b62e0, speed:'5.4 km/s', distTxt:'4.5B km',   temp:'-200°C',  landmarks: {'Great Dark Spot':[-22.0, 0.0]} }
+    ];
+
+    const planetMeshes = {};
+    const flags = [];
+    let landmarkMarker = null;
+    let pinPulse = null;
+    let lastLandmarkLocal = null;
+    let lastLandmarkNormal = null;
+    let currentLandmark = null;
+
+    function latLonToVector3(lat, lon, radius) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      return new THREE.Vector3(
+        -(radius * Math.sin(phi) * Math.cos(theta)),
+         (radius * Math.cos(phi)),
+         (radius * Math.sin(phi) * Math.sin(theta))
+      );
+    }
+
+    // ==== SUN SHADER ====
+    const sunUniforms = {
+      time: { value: 0 },
+      colorHot: { value: new THREE.Color(0xfff4c8) },
+      colorCool: { value: new THREE.Color(0xff3a05) }
+    };
+    const sunVertexShader = `
+      varying vec2 vUv;
+      varying vec3 vNormal;
+      varying vec3 vViewDir;
+      void main() {
+        vUv = uv;
+        vNormal = normalize(normalMatrix * normal);
+        vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+        vViewDir = normalize(-mvPos.xyz);
+        gl_Position = projectionMatrix * mvPos;
+      }
+    `;
+    const sunFragmentShader = `
+      uniform float time;
+      uniform vec3 colorHot;
+      uniform vec3 colorCool;
+      varying vec2 vUv;
+      varying vec3 vNormal;
+      varying vec3 vViewDir;
+
+      vec3 hash3(vec3 p) {
+        p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
+                 dot(p, vec3(269.5, 183.3, 246.1)),
+                 dot(p, vec3(113.5, 271.9, 124.6)));
+        return fract(sin(p) * 43758.5453);
+      }
+      float vnoise(vec3 p) {
+        vec3 i = floor(p);
+        vec3 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        float n000 = hash3(i + vec3(0.0,0.0,0.0)).x;
+        float n100 = hash3(i + vec3(1.0,0.0,0.0)).x;
+        float n010 = hash3(i + vec3(0.0,1.0,0.0)).x;
+        float n110 = hash3(i + vec3(1.0,1.0,0.0)).x;
+        float n001 = hash3(i + vec3(0.0,0.0,1.0)).x;
+        float n101 = hash3(i + vec3(1.0,0.0,1.0)).x;
+        float n011 = hash3(i + vec3(0.0,1.0,1.0)).x;
+        float n111 = hash3(i + vec3(1.0,1.0,1.0)).x;
+        float nx00 = mix(n000, n100, f.x);
+        float nx10 = mix(n010, n110, f.x);
+        float nx01 = mix(n001, n101, f.x);
+        float nx11 = mix(n011, n111, f.x);
+        float nxy0 = mix(nx00, nx10, f.y);
+        float nxy1 = mix(nx01, nx11, f.y);
+        return mix(nxy0, nxy1, f.z);
+      }
+
+      void main() {
+        vec3 p = vec3(vUv * 11.0, time * 0.28);
+        float n = vnoise(p);
+        n += 0.5 * vnoise(p * 2.1 + 3.0);
+        n += 0.25 * vnoise(p * 4.2 + 7.0);
+        n += 0.125 * vnoise(p * 8.0 + 11.0);
+        n = n / 1.875;
+
+        float flare = smoothstep(0.62, 0.95, vnoise(p * 1.4 + vec3(time * 0.15, 0.0, 2.0)));
+        vec3 col = mix(colorCool, colorHot, n);
+        col = mix(col, vec3(1.0, 0.95, 0.75), flare * 0.35);
+        float fres = pow(1.0 - max(0.0, dot(vNormal, vViewDir)), 2.0);
+        col += vec3(1.0, 0.72, 0.32) * fres * 1.55;
+        col *= 1.08;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    // ==== ATMOSPHERE SHADER ====
+    function addAtmosphere(mesh, radius, hexColor, intensity, scale) {
+      const uniforms = {
+        glowColor: { value: new THREE.Color(hexColor) },
+        intensity: { value: intensity }
+      };
+      const mat = new THREE.ShaderMaterial({
+        uniforms: uniforms,
+        vertexShader: `
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            vNormal = normalize(normalMatrix * normal);
+            vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+            vViewDir = normalize(-mvPos.xyz);
+            gl_Position = projectionMatrix * mvPos;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 glowColor;
+          uniform float intensity;
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            float rim = 1.0 - max(0.0, dot(vNormal, vViewDir));
+            float core = pow(rim, 2.2);
+            float haze = pow(rim, 4.5) * 0.55;
+            float a = (core + haze) * intensity;
+            gl_FragColor = vec4(glowColor * a, a);
+          }
+        `,
+        side: THREE.FrontSide,
+        blending: THREE.AdditiveBlending,
+        transparent: true,
+        depthWrite: false
+      });
+      const atmo = new THREE.Mesh(new THREE.SphereGeometry(radius * scale, 64, 64), mat);
+      atmo.name = 'atmosphere';
+      mesh.add(atmo);
+
+      // Soft outer halo
+      const mat2 = mat.clone();
+      mat2.uniforms = {
+        glowColor: { value: new THREE.Color(hexColor) },
+        intensity: { value: intensity * 0.35 }
+      };
+      const atmo2 = new THREE.Mesh(new THREE.SphereGeometry(radius * (scale + 0.06), 48, 48), mat2);
+      atmo2.name = 'atmosphereOuter';
+      mesh.add(atmo2);
+    }
+
+    // ==== BUILD PLANETS ====
+    planetsData.forEach(p => {
+      if (p.dist > 0) {
+        const pts = [];
+        for (let i = 0; i <= 180; i++) {
+          const a = (i / 180) * Math.PI * 2;
+          pts.push(new THREE.Vector3(Math.cos(a) * p.dist, 0, Math.sin(a) * p.dist));
+        }
+        const orbitGeo = new THREE.BufferGeometry().setFromPoints(pts);
+        const orbitMat = new THREE.LineBasicMaterial({ color: 0x88aaff, transparent: true, opacity: 0.12 });
+        scene.add(new THREE.Line(orbitGeo, orbitMat));
+      }
+
+      const isSun = (p.key === 'sun');
+      const isGas = (p.key === 'jupiter' || p.key === 'saturn' || p.key === 'uranus' || p.key === 'neptune');
+      const geo = new THREE.SphereGeometry(p.radius, 128, 128);
+
+      let mat;
+      if (isSun) {
+        mat = new THREE.ShaderMaterial({
+          uniforms: sunUniforms,
+          vertexShader: sunVertexShader,
+          fragmentShader: sunFragmentShader
         });
-    </script>
+      } else {
+        const procedural = makePlanetFallback(p.key);
+        mat = new THREE.MeshStandardMaterial({
+          map: procedural,
+          bumpMap: procedural,
+          bumpScale: isGas ? 0.025 : (p.key === 'earth' ? 0.04 : 0.06),
+          color: 0xffffff,
+          roughness: isGas ? 0.82 : (p.key === 'earth' ? 0.52 : 0.72),
+          metalness: p.key === 'earth' ? 0.12 : 0.04,
+          envMapIntensity: 0.4
+        });
+      }
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.x = p.dist;
+      mesh.userData = p;
+      scene.add(mesh);
+      planetMeshes[p.key] = mesh;
+
+      if (!isSun) {
+        textureLoader.load('http://localhost:__PORT__/' + p.texture,
+          (tex) => {
+            tex.anisotropy = MAX_ANISO;
+            tex.encoding = THREE.sRGBEncoding;
+            mat.map = tex;
+            mat.bumpMap = tex;
+            mat.color.setHex(0xffffff);
+            mat.needsUpdate = true;
+          },
+          undefined,
+          () => { /* keep procedural fallback */ }
+        );
+      }
+
+      if (isSun) {
+        const corona = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: sunGlowTex, color: 0xffaa55, transparent: true,
+          blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.8
+        }));
+        corona.scale.set(38, 38, 1);
+        mesh.add(corona);
+
+        const corona2 = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: sunGlowTex, color: 0xffeebb, transparent: true,
+          blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.95
+        }));
+        corona2.scale.set(17, 17, 1);
+        mesh.add(corona2);
+
+        const corona3 = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: sunGlowTex, color: 0xff6622, transparent: true,
+          blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.35
+        }));
+        corona3.scale.set(55, 55, 1);
+        mesh.add(corona3);
+      }
+
+      const atmos = {
+        earth:   { c: 0x4499ff, i: 2.0, s: 1.16 },
+        venus:   { c: 0xffcc66, i: 1.55, s: 1.14 },
+        mars:    { c: 0xff8855, i: 0.6, s: 1.12 },
+        jupiter: { c: 0xffd9a0, i: 0.55, s: 1.055 },
+        saturn:  { c: 0xffe6b0, i: 0.42, s: 1.055 },
+        uranus:  { c: 0x88ddff, i: 0.85, s: 1.09 },
+        neptune: { c: 0x5588ff, i: 1.0, s: 1.09 },
+        mercury: { c: 0xaaaaaa, i: 0.2, s: 1.07 }
+      };
+      if (atmos[p.key]) {
+        addAtmosphere(mesh, p.radius, atmos[p.key].c, atmos[p.key].i, atmos[p.key].s);
+      }
+
+      // Earth cloud layer
+      if (p.key === 'earth') {
+        const cloudCanvas = document.createElement('canvas');
+        cloudCanvas.width = 512; cloudCanvas.height = 256;
+        const cctx = cloudCanvas.getContext('2d');
+        cctx.fillStyle = 'rgba(0,0,0,0)';
+        cctx.clearRect(0, 0, 512, 256);
+        for (let i = 0; i < 900; i++) {
+          const x = Math.random() * 512;
+          const y = 20 + Math.random() * 216;
+          const r = 4 + Math.random() * 18;
+          cctx.fillStyle = 'rgba(255,255,255,' + (0.04 + Math.random() * 0.10) + ')';
+          cctx.beginPath(); cctx.arc(x, y, r, 0, Math.PI * 2); cctx.fill();
+        }
+        const cloudTex = new THREE.CanvasTexture(cloudCanvas);
+        const clouds = new THREE.Mesh(
+          new THREE.SphereGeometry(p.radius * 1.015, 64, 64),
+          new THREE.MeshStandardMaterial({
+            map: cloudTex, transparent: true, opacity: 0.45, depthWrite: false,
+            roughness: 1, metalness: 0
+          })
+        );
+        clouds.name = 'clouds';
+        mesh.add(clouds);
+      }
+
+      if (p.rings) {
+        const ringGeo = new THREE.RingGeometry(p.radius * 1.35, p.radius * 2.35, 160);
+        (function remapRingUV(g, inner, outer) {
+          const pos = g.attributes.position, uv = g.attributes.uv;
+          for (let i = 0; i < pos.count; i++) {
+            const r = Math.hypot(pos.getX(i), pos.getY(i));
+            uv.setXY(i, (r - inner) / (outer - inner), 0.5);
+          }
+          uv.needsUpdate = true;
+        })(ringGeo, p.radius * 1.35, p.radius * 2.35);
+        const ringMat = new THREE.MeshBasicMaterial({
+          map: ringTex,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false
+        });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = Math.PI / 2;
+        mesh.add(ring);
+
+        const ring2Geo = new THREE.RingGeometry(p.radius * 1.18, p.radius * 1.32, 128);
+        const ring2Mat = new THREE.MeshBasicMaterial({
+          color: 0xd9c9a3, side: THREE.DoubleSide, transparent: true, opacity: 0.28
+        });
+        const ring2 = new THREE.Mesh(ring2Geo, ring2Mat);
+        ring2.rotation.x = Math.PI / 2;
+        mesh.add(ring2);
+      }
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    let activePlanet = null;
+    let cameraMode = 'overview';
+    let cameraTargetPos = new THREE.Vector3(0, 60, 120);
+    let lookAtTarget = new THREE.Vector3(0, 0, 0);
+    let currentLook = new THREE.Vector3(0, 0, 0);
+    let blockClicksUntil = 0;
+
+    let isUserInteracting = false;
+    let previousMousePosition = { x: 0, y: 0 };
+    let zoomLevel = 1.0;
+
+    // ==== BLOOM / LIGHTING PER MODE (landmark aggressively dimmed for pin readability) ====
+    function updateBloomForMode(mode) {
+      if (mode === 'overview') {
+        renderer.toneMappingExposure = 1.08;
+        bloomPass.strength = 1.2;
+        bloomPass.radius = 0.5;
+        bloomPass.threshold = 0.7;
+        ambientLight.intensity = 0.12;
+        sunLight.intensity = 2.6;
+        hemi.intensity = 0.28;
+        fillLight.intensity = 0.28;
+        rimLight.intensity = 0.12;
+        closeFill.intensity = 0.0;
+      } else if (mode === 'planet') {
+        renderer.toneMappingExposure = 0.72;
+        bloomPass.strength = 0.38;
+        bloomPass.radius = 0.4;
+        bloomPass.threshold = 0.9;
+        ambientLight.intensity = 0.22;
+        sunLight.intensity = 1.55;
+        hemi.intensity = 0.38;
+        fillLight.intensity = 0.35;
+        rimLight.intensity = 0.08;
+        closeFill.intensity = 0.18;
+      } else if (mode === 'landmark') {
+        // Strongly dim bloom/exposure so the red pin and surface stay readable
+        renderer.toneMappingExposure = 0.48;
+        bloomPass.strength = 0.08;
+        bloomPass.radius = 0.25;
+        bloomPass.threshold = 0.98;
+        ambientLight.intensity = 0.36;
+        sunLight.intensity = 0.95;
+        hemi.intensity = 0.45;
+        fillLight.intensity = 0.4;
+        rimLight.intensity = 0.04;
+        closeFill.intensity = 0.42;
+      }
+    }
+
+    document.getElementById('zoom-in').addEventListener('click', () => {
+      zoomLevel = Math.max(0.5, zoomLevel - 0.15);
+    });
+    document.getElementById('zoom-out').addEventListener('click', () => {
+      zoomLevel = Math.min(2.5, zoomLevel + 0.15);
+    });
+
+    function openModal() {
+      document.getElementById('modal-overlay').classList.add('active');
+      document.getElementById('colony-input').focus();
+    }
+    function closeModal() {
+      document.getElementById('modal-overlay').classList.remove('active');
+      document.getElementById('colony-input').value = '';
+    }
+    function confirmColony() {
+      const name = document.getElementById('colony-input').value.trim() || "UNNAMED COLONY";
+      closeModal();
+      plantFlag(name);
+    }
+
+    function isUiTarget(el) {
+      if (!el || !el.tagName) return false;
+      const t = el.tagName;
+      if (t === 'SELECT' || t === 'BUTTON' || t === 'INPUT' || t === 'TEXTAREA') return true;
+      if (el.closest && (el.closest('#ui') || el.closest('.zoom-controls') || el.closest('#modal-overlay') || el.closest('#exit-landmark') || el.closest('#colony-display') || el.closest('#landmark-panel'))) return true;
+      return false;
+    }
+
+    window.addEventListener('mousedown', (e) => {
+      if (isUiTarget(e.target)) return;
+      isUserInteracting = true;
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    });
+    window.addEventListener('mouseup', () => { isUserInteracting = false; });
+    window.addEventListener('mousemove', (e) => {
+      if (isUserInteracting && activePlanet && cameraMode === 'landmark') {
+        const deltaX = e.clientX - previousMousePosition.x;
+        const deltaY = e.clientY - previousMousePosition.y;
+        activePlanet.rotation.y += deltaX * 0.005;
+        activePlanet.rotation.x += deltaY * 0.005;
+      }
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('click', (event) => {
+      if (isUiTarget(event.target)) return;
+      if (isUserInteracting) return;
+      if (Date.now() < blockClicksUntil) return;
+
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(Object.values(planetMeshes));
+      if (hits.length > 0) {
+        const key = hits[0].object.userData.key;
+        document.getElementById('planet-select').value = key;
+        selectPlanet(key);
+      }
+    });
+
+    function exitLandmark() {
+      if (!activePlanet) return;
+      cameraMode = 'planet';
+      updateBloomForMode('planet');
+      document.getElementById('exit-landmark').classList.remove('active');
+      document.getElementById('ui').style.opacity = '1';
+      landmarkLight.intensity = 0;
+      setLandmarkPanel(false);
+      currentLandmark = null;
+      if (landmarkMarker) {
+        activePlanet.remove(landmarkMarker);
+        landmarkMarker = null;
+        pinPulse = null;
+      }
+      const p = activePlanet.userData;
+      const offset = new THREE.Vector3(p.radius * 4, p.radius * 2.5, p.radius * 4);
+      cameraTargetPos.copy(activePlanet.position).add(offset);
+      lookAtTarget.copy(activePlanet.position);
+    }
+
+    function selectPlanet(key) {
+      blockClicksUntil = Date.now() + 500;
+      document.getElementById('exit-landmark').classList.remove('active');
+      document.getElementById('ui').style.opacity = '1';
+      landmarkLight.intensity = 0;
+      setLandmarkPanel(false);
+      currentLandmark = null;
+      zoomLevel = 1.0;
+
+      if (landmarkMarker && activePlanet) {
+        activePlanet.remove(landmarkMarker);
+        landmarkMarker = null;
+        pinPulse = null;
+      }
+
+      if (key === 'overview') {
+        activePlanet = null;
+        cameraMode = 'overview';
+        updateBloomForMode('overview');
+        cameraTargetPos.set(0, 60, 120);
+        lookAtTarget.set(0, 0, 0);
+        document.getElementById('planet-controls').style.display = 'none';
+        return;
+      }
+
+      document.getElementById('planet-controls').style.display = 'block';
+      cameraMode = 'planet';
+      updateBloomForMode('planet');
+
+      if (activePlanet) {
+        activePlanet.rotation.x = 0;
+        activePlanet.rotation.y = 0;
+      }
+
+      activePlanet = planetMeshes[key];
+      const p = activePlanet.userData;
+
+      document.getElementById('val-speed').innerText = p.speed;
+      document.getElementById('val-dist').innerText  = p.distTxt;
+      document.getElementById('val-temp').innerText  = p.temp;
+
+      const lmDiv = document.getElementById('landmarks');
+      lmDiv.innerHTML = '';
+      for (const [name, coords] of Object.entries(p.landmarks)) {
+        const btn = document.createElement('button');
+        btn.className = 'landmark-btn';
+        btn.innerText = name;
+        btn.onclick = () => focusLandmark(name, coords);
+        lmDiv.appendChild(btn);
+      }
+
+      const offset = new THREE.Vector3(p.radius * 4, p.radius * 2.5, p.radius * 4);
+      cameraTargetPos.copy(activePlanet.position).add(offset);
+      lookAtTarget.copy(activePlanet.position);
+    }
+
+    // ==== LANDMARK PLACEMENT ====
+    const SAVED_CALIBRATION = __CALIBRATION__;
+    const Y_AXIS = new THREE.Vector3(0, 1, 0);
+    const offsets = {};
+    Object.keys(SAVED_CALIBRATION || {}).forEach(k => {
+      offsets[k] = { lat: Number(SAVED_CALIBRATION[k].lat) || 0, lon: Number(SAVED_CALIBRATION[k].lon) || 0 };
+    });
+    function getOffset(key) {
+      if (!offsets[key]) offsets[key] = { lat: 0, lon: 0 };
+      return offsets[key];
+    }
+
+    function landmarkLocal(planetKey, radius, coords) {
+      const opts = coords[2] || {};
+      if (opts.ring) {
+        const a = coords[1] * Math.PI / 180;
+        return {
+          pos: new THREE.Vector3(Math.cos(a) * opts.ring * radius, 0, Math.sin(a) * opts.ring * radius),
+          normal: Y_AXIS.clone(), ring: true
+        };
+      }
+      const off = getOffset(planetKey);
+      const lat = Math.max(-89, Math.min(89, coords[0] + off.lat));
+      const pos = latLonToVector3(lat, coords[1] + off.lon, radius);
+      return { pos: pos, normal: pos.clone().normalize(), ring: false };
+    }
+
+    function formatCoords(lat, lon) {
+      const l = ((lon + 180) % 360 + 360) % 360 - 180;
+      return Math.abs(lat).toFixed(2) + '°' + (lat >= 0 ? 'N' : 'S') + '   ' +
+             Math.abs(l).toFixed(2) + '°' + (l >= 0 ? 'E' : 'W');
+    }
+
+    // Clear, saturated red pin — MeshBasic + toneMapped:false so bloom does not wash it out
+    function buildPin(radius) {
+      const s = Math.max(radius * 0.055, 0.04);
+      const group = new THREE.Group();
+      const RED = 0xff1212;
+      const DARK = 0x4a0000;
+
+      function basic(color, opacity) {
+        return new THREE.MeshBasicMaterial({
+          color: color, transparent: opacity < 1, opacity: opacity,
+          depthWrite: false, side: THREE.DoubleSide, toneMapped: false
+        });
+      }
+
+      // Dark outline ring for contrast on bright surfaces
+      const ringOuter = new THREE.Mesh(new THREE.RingGeometry(s * 0.85, s * 1.15, 64), basic(DARK, 0.95));
+      ringOuter.rotation.x = -Math.PI / 2;
+      ringOuter.position.y = s * 0.04;
+      ringOuter.renderOrder = 9;
+      group.add(ringOuter);
+
+      const ring = new THREE.Mesh(new THREE.RingGeometry(s * 0.9, s * 1.08, 64), basic(RED, 1.0));
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = s * 0.05;
+      ring.renderOrder = 10;
+      group.add(ring);
+
+      const pulse = new THREE.Mesh(new THREE.RingGeometry(s * 0.9, s * 1.08, 64), basic(RED, 0.55));
+      pulse.rotation.x = -Math.PI / 2;
+      pulse.position.y = s * 0.05;
+      pulse.renderOrder = 10;
+      group.add(pulse);
+      pinPulse = pulse;
+
+      const tip = new THREE.Mesh(new THREE.ConeGeometry(s * 0.16, s * 0.42, 16), basic(RED, 1.0));
+      tip.rotation.x = Math.PI;
+      tip.position.y = s * 0.18;
+      tip.renderOrder = 11;
+      group.add(tip);
+
+      const stem = new THREE.Mesh(new THREE.CylinderGeometry(s * 0.035, s * 0.045, s * 2.4, 10), basic(0xb00000, 1.0));
+      stem.position.y = s * 1.35;
+      stem.renderOrder = 11;
+      group.add(stem);
+
+      const headOutline = new THREE.Mesh(new THREE.SphereGeometry(s * 0.28, 20, 16), basic(DARK, 1.0));
+      headOutline.position.y = s * 2.55;
+      headOutline.renderOrder = 11;
+      group.add(headOutline);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(s * 0.22, 20, 16), basic(RED, 1.0));
+      head.position.y = s * 2.55;
+      head.renderOrder = 12;
+      group.add(head);
+
+      // Soft red glow sprite (low opacity — bloom is nearly off in landmark mode)
+      const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: redGlowTex, color: 0xff2020, transparent: true,
+        blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.55, toneMapped: false
+      }));
+      glow.position.y = s * 2.55;
+      glow.scale.set(s * 3.2, s * 3.2, 1);
+      glow.renderOrder = 8;
+      group.add(glow);
+
+      return group;
+    }
+
+    function makeLabelSprite(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512; canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 512, 128);
+      ctx.font = '700 56px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,255,255,0.9)';
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(text, 256, 64);
+      const tex = new THREE.CanvasTexture(canvas);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, transparent: true, depthWrite: false
+      }));
+      return sprite;
+    }
+
+    function setLandmarkPanel(show) {
+      document.getElementById('landmark-panel').classList.toggle('active', show);
+    }
+
+    function updateLandmarkCaption() {
+      if (!currentLandmark || !activePlanet) return;
+      const p = activePlanet.userData;
+      const c = currentLandmark.coords;
+      const isRing = !!(c[2] && c[2].ring);
+      document.getElementById('lm-name').innerText = p.key.toUpperCase() + '  /  ' + currentLandmark.name.toUpperCase();
+      document.getElementById('lm-coords').innerText = isRing
+        ? 'RING GAP  ' + c[2].ring.toFixed(2) + ' PLANET RADII'
+        : formatCoords(c[0], c[1]);
+      const off = getOffset(p.key);
+      const hasOff = !isRing && (off.lat !== 0 || off.lon !== 0);
+      document.getElementById('lm-offset').innerText = hasOff
+        ? 'alignment offset  lat ' + off.lat.toFixed(2) + '°  lon ' + off.lon.toFixed(2) + '°'
+        : '';
+    }
+
+    function placeLandmark() {
+      if (!activePlanet || !currentLandmark) return;
+      const p = activePlanet.userData;
+      activePlanet.rotation.set(0, 0, 0);
+
+      const info = landmarkLocal(p.key, p.radius, currentLandmark.coords);
+      lastLandmarkLocal = info.pos.clone();
+      lastLandmarkNormal = info.normal.clone();
+
+      if (!landmarkMarker) {
+        landmarkMarker = buildPin(p.radius);
+        activePlanet.add(landmarkMarker);
+      }
+      landmarkMarker.position.copy(info.pos);
+      landmarkMarker.quaternion.setFromUnitVectors(Y_AXIS, info.normal);
+
+      const worldPoint = activePlanet.position.clone().add(info.pos);
+      if (info.ring) {
+        const camDir = info.pos.clone().normalize().multiplyScalar(0.7).add(new THREE.Vector3(0, 0.9, 0)).normalize();
+        cameraTargetPos.copy(worldPoint).add(camDir.multiplyScalar(p.radius * 2.2));
+      } else {
+        cameraTargetPos.copy(activePlanet.position).add(info.normal.clone().multiplyScalar(p.radius * 1.75));
+      }
+      lookAtTarget.copy(worldPoint);
+
+      landmarkLight.position.copy(cameraTargetPos).add(new THREE.Vector3(0, p.radius * 1.2, 0));
+      landmarkLight.target.position.copy(worldPoint);
+      landmarkLight.angle = Math.PI / 5;
+      landmarkLight.penumbra = 0.9;
+      // Soft key — keep modest so pin color stays true
+      landmarkLight.intensity = 0.55;
+    }
+
+    function focusLandmark(name, coords) {
+      if (!activePlanet) return;
+      cameraMode = 'landmark';
+      updateBloomForMode('landmark');
+      document.getElementById('exit-landmark').classList.add('active');
+      document.getElementById('ui').style.opacity = '0.2';
+      zoomLevel = 1.0;
+
+      if (landmarkMarker) {
+        activePlanet.remove(landmarkMarker);
+        landmarkMarker = null;
+        pinPulse = null;
+      }
+      currentLandmark = { name: name, coords: coords };
+      const isRing = !!(coords[2] && coords[2].ring);
+      document.getElementById('calib').style.display = isRing ? 'none' : 'flex';
+      document.getElementById('calib-note').innerText = '';
+
+      placeLandmark();
+      updateLandmarkCaption();
+      setLandmarkPanel(true);
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    }
+
+    function nudge(dLat, dLon) {
+      if (cameraMode !== 'landmark' || !currentLandmark || !activePlanet) return;
+      const c = currentLandmark.coords;
+      if (c[2] && c[2].ring) return;
+      const step = parseFloat(document.getElementById('calib-step').value) || 1;
+      const off = getOffset(activePlanet.userData.key);
+      off.lat = Math.round((off.lat + dLat * step) * 100) / 100;
+      off.lon = Math.round((off.lon + dLon * step) * 100) / 100;
+      placeLandmark();
+      updateLandmarkCaption();
+    }
+
+    function resetOffset() {
+      if (!activePlanet) return;
+      const key = activePlanet.userData.key;
+      const seed = (SAVED_CALIBRATION && SAVED_CALIBRATION[key]) || { lat: 0, lon: 0 };
+      offsets[key] = { lat: Number(seed.lat) || 0, lon: Number(seed.lon) || 0 };
+      placeLandmark();
+      updateLandmarkCaption();
+    }
+
+    function copyCalibration() {
+      const out = {};
+      Object.keys(offsets).forEach(k => {
+        if (offsets[k].lat || offsets[k].lon) out[k] = { lat: offsets[k].lat, lon: offsets[k].lon };
+      });
+      const text = 'CALIBRATION = ' + JSON.stringify(out);
+      const note = document.getElementById('calib-note');
+      const show = ok => { note.innerText = ok ? 'Copied. Paste it over CALIBRATION near the top of the script.' : text; };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => show(true), () => show(false));
+      } else {
+        show(false);
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (cameraMode !== 'landmark') return;
+      const t = e.target && e.target.tagName;
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
+      if (e.key === 'ArrowLeft')       { nudge(0, -1); e.preventDefault(); }
+      else if (e.key === 'ArrowRight') { nudge(0, 1);  e.preventDefault(); }
+      else if (e.key === 'ArrowUp')    { nudge(1, 0);  e.preventDefault(); }
+      else if (e.key === 'ArrowDown')  { nudge(-1, 0); e.preventDefault(); }
+      else if (e.key === 'Escape')     { exitLandmark(); }
+    });
+
+    function plantFlag(name) {
+      if (!activePlanet) return;
+      const p = activePlanet.userData;
+
+      let localPos, normal;
+      if (cameraMode === 'landmark' && lastLandmarkLocal) {
+        localPos = lastLandmarkLocal.clone();
+        normal = lastLandmarkNormal.clone();
+      } else {
+        localPos = activePlanet.worldToLocal(camera.position.clone()).normalize().multiplyScalar(p.radius);
+        normal = localPos.clone().normalize();
+      }
+
+      const s = p.radius * 0.08;
+      const flag = new THREE.Group();
+
+      const pole = new THREE.Mesh(
+        new THREE.CylinderGeometry(s * 0.05, s * 0.05, s * 4, 8),
+        new THREE.MeshBasicMaterial({ color: 0xdddddd })
+      );
+      pole.position.y = s * 2;
+      flag.add(pole);
+
+      const cloth = new THREE.Mesh(
+        new THREE.PlaneGeometry(s * 2, s * 1.2),
+        new THREE.MeshBasicMaterial({ color: 0x00ffff, side: THREE.DoubleSide })
+      );
+      cloth.position.set(s * 1.0, s * 3.4, 0);
+      flag.add(cloth);
+
+      const label = makeLabelSprite(name.toUpperCase());
+      label.position.y = s * 5.2;
+      label.scale.set(s * 6, s * 1.5, 1);
+      flag.add(label);
+
+      flag.position.copy(localPos);
+      flag.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+      activePlanet.add(flag);
+      flags.push({ mesh: flag, planet: p.key, name: name });
+
+      const disp = document.getElementById('colony-display');
+      document.getElementById('colony-name-display').innerText = name.toUpperCase();
+      disp.classList.add('active');
+      setTimeout(() => disp.classList.remove('active'), 3000);
+    }
+
+    // ==== RENDER LOOP ====
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+      sunUniforms.time.value = t;
+
+      Object.keys(planetMeshes).forEach(key => {
+        const m = planetMeshes[key];
+        if (m === activePlanet && cameraMode === 'landmark') return;
+        m.rotation.y += key === 'sun' ? 0.0008 : 0.002;
+        const clouds = m.getObjectByName('clouds');
+        if (clouds) clouds.rotation.y += 0.00035;
+      });
+
+      if (window._stars) window._stars.rotation.y += 0.00003;
+
+      if (pinPulse) {
+        const ph = (t * 0.85) % 1;
+        pinPulse.scale.setScalar(1 + ph * 1.15);
+        pinPulse.material.opacity = 0.55 * (1 - ph);
+      }
+
+      const desired = lookAtTarget.clone().add(cameraTargetPos.clone().sub(lookAtTarget).multiplyScalar(zoomLevel));
+      camera.position.lerp(desired, 0.06);
+      currentLook.lerp(lookAtTarget, 0.08);
+      camera.lookAt(currentLook);
+
+      composer.render();
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateBloomForMode('overview');
+    animate();
+  </script>
 </body>
 </html>
+"""
+
+html = html_template.replace('__PORT__', str(PORT)).replace('__CALIBRATION__', json.dumps(CALIBRATION))
+out_name = 'nisar_solar_system.html'
+with open(out_name, 'w', encoding='utf-8') as f:
+    f.write(html)
+
+url = 'http://localhost:%d/%s' % (PORT, out_name)
+print('Serving NISAR Solar System at ' + url)
+print('Put planet textures (sun.jpg, earth.jpg, ...) next to this script. Press Ctrl+C to stop.')
+threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+try:
+    in_notebook = get_ipython() is not None  # noqa: F821
+except NameError:
+    in_notebook = False
+if not in_notebook:
+    # Plain script: keep the server alive until Ctrl+C
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        httpd.shutdown()
+# In a notebook the server runs in a background thread, so the cell can finish
+# and the page keeps working. Run httpd.shutdown() in a cell to stop it.
