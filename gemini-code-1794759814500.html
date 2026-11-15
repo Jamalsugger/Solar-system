@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Solar System</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Include Three.js from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        // 1. Scene, Camera, and Renderer Setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // 2. Lighting
+        const ambientLight = new THREE.AmbientLight(0x333333);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xffffff, 2, 300);
+        pointLight.position.set(0, 0, 0);
+        scene.add(pointLight);
+
+        // 3. Create the Sun
+        const sunGeometry = new THREE.SphereGeometry(5, 32, 32);
+        const sunMaterial = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+        const sun = new THREE.Mesh(sunGeometry, sunMaterial);
+        scene.add(sun);
+
+        // 4. Create Planets Array
+        const planetsData = [
+            { name: 'Mercury', size: 0.8, distance: 8, color: 0x888888, speed: 0.04 },
+            { name: 'Venus', size: 1.2, distance: 12, color: 0xe3bb76, speed: 0.015 },
+            { name: 'Earth', size: 1.4, distance: 17, color: 0x2233ff, speed: 0.01 },
+            { name: 'Mars', size: 1.0, distance: 22, color: 0xcc4400, speed: 0.008 }
+        ];
+
+        const planets = [];
+
+        planetsData.forEach(data => {
+            const geometry = new THREE.SphereGeometry(data.size, 32, 32);
+            const material = new THREE.MeshStandardMaterial({ color: data.color, roughness: 0.8 });
+            const mesh = new THREE.Mesh(geometry, material);
+            
+            scene.add(mesh);
+            planets.push({ mesh, distance: data.distance, speed: data.speed, angle: Math.random() * Math.PI * 2 });
+        });
+
+        // Position Camera
+        camera.position.set(0, 20, 35);
+        camera.lookAt(0, 0, 0);
+
+        // 5. Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Rotate Sun
+            sun.rotation.y += 0.002;
+
+            // Orbit Planets
+            planets.forEach(planet => {
+                planet.angle += planet.speed;
+                planet.mesh.position.x = Math.cos(planet.angle) * planet.distance;
+                planet.mesh.position.z = Math.sin(planet.angle) * planet.distance;
+                planet.mesh.rotation.y += 0.01;
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
